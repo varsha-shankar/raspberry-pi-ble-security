@@ -81,10 +81,12 @@ except Exception as e:
 
 def path_to_mac(path: str) -> str:
     """Convert BlueZ device object path to MAC string."""
+    print("path to mac ====",path.split("/")[-1].replace("dev_", "").replace("_", ":"))
     return path.split("/")[-1].replace("dev_", "").replace("_", ":")
 
 def save_trusted_device(device_id):
-    with open(TRUSTED_DEVICE_FILE,"W") as f:
+    print("save trsuted device called and the id ===",device_id)
+    with open(TRUSTED_DEVICE_FILE,"w") as f:
         json.dump({"device_id":device_id},f)
         
 def load_trusted_device():
@@ -97,31 +99,60 @@ def load_trusted_device():
 def trust_device(device_path: str):
     global token_verified, last_trusted_mac
     try:
-        dev = bus.get_object("org.bluez", device_path)
-        props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
-        props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
-
-        mac = path_to_mac(device_path)
-        save_trusted_device(mac)
-        last_trusted_mac = mac
-        mac = path_to_mac(device_path)
-        if token_verified:
-            props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
-            if mac != last_trusted_mac:
-                save_trusted_device(mac)
-                last_trusted_mac = mac
-        else:
+        if not token_verified:
             print("⚠️ Skipping trust — token not verified")
             return
 
-        subprocess.run(["bluetoothctl", "pairable", "off"], check=False)
+        dev = bus.get_object("org.bluez", device_path)
+        props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
+
+        # Set Trusted = True via D-Bus
+        props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+
+        mac = path_to_mac(device_path).strip()
+        print(f"path to mac ==== {mac}")
+        if not mac or ":" not in mac:
+            print("❌ Invalid MAC format; skipping bluetoothctl trust")
+            return
+
+        print(f"mac now is === {mac}")
+        print(f"Device id === {mac}")
+
+        if mac != last_trusted_mac:
+            print(f"last trusted macd is ",last_trusted_mac)
+            print(f"mac is ",mac)
+            save_trusted_device(mac)
+            last_trusted_mac = mac
+            print(f"2 last trusted macd is ",last_trusted_mac)
+            print(f"2 mac is ",mac)
+
+        # ✅ Run trust command (safe and clean)
+        result = subprocess.run(
+            ["bluetoothctl", "--", "trust", mac],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        print("result is = ",result)
+        if result.returncode != 0:
+            print(f"❌ bluetoothctl trust failed:\n{result.stderr.strip()}")
+        else:
+            print(f"✅ bluetoothctl trust succeeded:\n{result.stdout.strip()}")
+       
+        GLib.timeout_add_seconds(5, disable_pairable)
+
+        #subprocess.run(["bluetoothctl", "--", "pairable", "off"], check=False)
         print(f"🔒 Device trusted & pairable disabled: {mac}")
         token_verified = True
+
     except Exception as e:
-        print(f"⚠️  Could not trust device: {e}")
+        print(f"⚠️ Could not trust device: {e}")
         token_verified = False
 
-
+def disable_pairable():
+    subprocess.run(["bluetoothctl", "pairable", "off"])
+    print("🛑 Pairable mode disabled after delay")
+    return False  # GLib timeout must return False to stop repeating
 
 def trigger_alarm():
     """Sound buzzer for 3 seconds."""
@@ -154,20 +185,44 @@ class TokenCharacteristic(Characteristic):
     @dbus.service.method("org.bluez.GattCharacteristic1",
                          in_signature="aya{sv}", out_signature="")
     def WriteValue(self, value, options):
+        print("write value called on toekn characteristics")
         global authorized_device_path, token_verified
         device = options.get("device")
-        token = bytes(value).decode("utf-8", errors="ignore")
+        device_address = path_to_mac(device)
+        
+          # ✅ If device is already trusted, skip TOTP
+#         if mac == last_trusted_mac:
+#             print(f"✅ {mac} is already trusted. Skipping TOTP check.")
+#             token_verified = True
+#             authorized_device_path = device
+#             return
+               
+        token = bytes(value).decode("utf-8", errors="ignore").strip()
         print(f"🔑 Token received from {path_to_mac(device)} → '{token}'")
-        totp = pyotp.TOTP(TOTP_SECRET)
+        
+        TOTP_SECRET_BASE32 = TOTP_SECRET.upper().replace(" ", "")
+
+        totp = pyotp.TOTP(TOTP_SECRET_BASE32)
+        # Print expected OTP for debugging
+        now = int(time.time())
+        prev_otp = totp.at(now - 30)
+        current_otp = totp.at(now)
+        next_otp = totp.at(now + 30)
+        print(f"📟 Acceptable OTPs: {prev_otp} (prev), {current_otp} (current), {next_otp} (next)")
+
+        # Verify against ±1 time step
         if totp.verify(token):
+            print(f"✅ Valid TOTP from {device_address}. Access granted.")
+            token_verified = True
             authorized_device_path = device
             trust_device(device)
-            print("✅ Valid TOTP accepted. Device authorized.")
+            # ... your access-granted code ...
         else:
-            print("⛔ Invalid TOTP. Access denied.")
-            print(f"⛔ Invalid TOTP from {path_to_mac(device)}. Access denied.")
-            print(f"⏱️ Server time: {int(time.time())}, expected TOTP: {totp.now()}")
+            print(f"⛔ Invalid TOTP. Access denied.")
+            print(f"⛔ Invalid TOTP from {device_address}. Access denied.")
+            print(f"⏱️ Server time: {int(time.time())}")
             token_verified = False
+            trigger_alarm()
 
 
 class SecureCharacteristic(Characteristic):
