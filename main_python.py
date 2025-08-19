@@ -255,7 +255,7 @@ class SecureCharacteristic(Characteristic):
 
     def __init__(self, bus, index, service):
         super().__init__(bus, index, DATA_CHAR_UUID,
-                         ["read", "write", "write-without-response", "notify"], service)
+                         ["read", "write", "write-without-response"], service)
         self.value = dbus.Array([], signature='y')
         self.notifying = False
 
@@ -409,43 +409,40 @@ def properties_changed_handler(interface, changed, invalidated, path):
 
     if connected:
         print(f"🔗 Device connected: {mac}")
-        
-        
-        
-        if last_trusted_mac and mac != last_trusted_mac:
-            print("⚠️  Unauthorized device attempted to connect!")
-            trigger_alarm()
 
-            # TODO: notify original device via BLE notify or FCM later
-            try:
-                dev = bus.get_object("org.bluez", path)
-                dev_iface = dbus.Interface(dev, "org.bluez.Device1")
-                dev_iface.Disconnect()
-                print("❌ Disconnected unauthorized device")
-            except Exception as e:
-                print(f"⚠️  Could not disconnect: {e}")
+        try:
+            dev = bus.get_object("org.bluez", path)
+            props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
+            dev_iface = dbus.Interface(dev, "org.bluez.Device1")
 
-            return  # Do not proceed with session for this device
+            # 🔑 Ensure bonding happens right away
+            paired = bool(props.Get("org.bluez.Device1", "Paired"))
+            if not paired:
+                print(f"📌 Initiating bonding for {mac}")
+                try:
+                    dev_iface.Pair()   # force bonding
+                except Exception as e:
+                    print(f"⚠️ Bonding request error: {e}")
+            else:
+                print(f"✅ {mac} already bonded")
 
+        except Exception as e:
+            print(f"⚠️ Could not check bonding state: {e}")
+
+        # Reset session state
         token_verified = False
         authorized_device_path = None
-        
-        if mac == last_trusted_mac:
+
+
+    if mac == last_trusted_mac:
             print(f"✅ Known trusted device {mac} reconnected")
             authorized_device_path = path
             token_verified = True
             try:
-                dev = bus.get_object("org.bluez", path)
-                props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
                 if bool(props.Get("org.bluez.Device1", "Paired")):
                     trust_device(path)
             except Exception as e:
                 print(f"⚠️ Could not re-check Paired state: {e}")
-           
-        else:
-            token_verified = False
-            authorized_device_path = None
-
 
     else:
         print(f"🔌 Device disconnected: {mac}")
@@ -455,6 +452,7 @@ def properties_changed_handler(interface, changed, invalidated, path):
         authorized_device_path = None
         app.stop_advertising()
         app.start_advertising()
+
 
 
 # -----------------------------
