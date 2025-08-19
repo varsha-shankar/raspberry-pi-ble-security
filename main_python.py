@@ -46,13 +46,6 @@ BUZZER_PIN = 18                   # GPIO pin for buzzer
 TRUSTED_DEVICE_FILE = "trusted_device.json"
 TOTP_SECRET = "JBSWY3DPEHPK3PXP"  # 🔐 base32-encoded TOTP secret (same on Pi + app)
 
-def load_trusted_device():
-    try:
-        with open(TRUSTED_DEVICE_FILE,"r") as f:
-            return json.load(f).get("device_id")
-    except:
-        return None
-
 # -----------------------------
 # Global state flags
 # -----------------------------
@@ -62,6 +55,14 @@ ad_index_counter = 0               # incremented each ad restart
 
 authorized_device_path = None      # DBus object path of trusted phone
 token_verified = False             # True once phone sent correct token
+
+def load_trusted_device():
+    try:
+        with open(TRUSTED_DEVICE_FILE,"r") as f:
+            return json.load(f).get("device_id")
+    except:
+        return None
+
 last_trusted_mac = load_trusted_device()  # Persisted MAC
 
 # -----------------------------
@@ -88,13 +89,6 @@ def save_trusted_device(device_id):
     print("save trsuted device called and the id ===",device_id)
     with open(TRUSTED_DEVICE_FILE,"w") as f:
         json.dump({"device_id":device_id},f)
-        
-def load_trusted_device():
-    try:
-        with open(TRUSTED_DEVICE_FILE,"r") as f:
-            return json.load(f).get("device_id")
-    except:
-        return None
 
 def trust_device(device_path: str):
     global token_verified, last_trusted_mac
@@ -106,53 +100,84 @@ def trust_device(device_path: str):
         dev = bus.get_object("org.bluez", device_path)
         props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
 
-        # Set Trusted = True via D-Bus
-        props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
-
         mac = path_to_mac(device_path).strip()
-        print(f"path to mac ==== {mac}")
-        if not mac or ":" not in mac:
-            print("❌ Invalid MAC format; skipping bluetoothctl trust")
+        print(f"🧾 Trust request for {mac}")
+
+        # Wait up to ~6s for pairing to settle (iOS can be slow)
+        deadline = time.time() + 6.0
+        paired = False
+        while time.time() < deadline:
+            try:
+                paired = bool(props.Get("org.bluez.Device1", "Paired"))
+                if paired:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25)
+
+        print(f"🔗 Paired state for {mac}: {paired}")
+
+        if not paired:
+            print(f"⛔ {mac} not paired yet. Will not set Trusted or disable pairable.")
             return
 
-        print(f"mac now is === {mac}")
-        print(f"Device id === {mac}")
+        # Mark trusted if not already
+        try:
+            already_trusted = bool(props.Get("org.bluez.Device1", "Trusted"))
+        except Exception:
+            already_trusted = False
 
-        if mac != last_trusted_mac:
-            print(f"last trusted macd is ",last_trusted_mac)
-            print(f"mac is ",mac)
+        if not already_trusted:
+            props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+            print(f"✅ D-Bus Trusted set for {mac}")
+
+        # Persist MAC if changed
+        if mac and (mac != last_trusted_mac):
             save_trusted_device(mac)
             last_trusted_mac = mac
-            print(f"2 last trusted macd is ",last_trusted_mac)
-            print(f"2 mac is ",mac)
 
-        # ✅ Run trust command (safe and clean)
-        result = subprocess.run(
-            ["bluetoothctl", "--", "trust", mac],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        print("result is = ",result)
-        if result.returncode != 0:
-            print(f"❌ bluetoothctl trust failed:\n{result.stderr.strip()}")
-        else:
-            print(f"✅ bluetoothctl trust succeeded:\n{result.stdout.strip()}")
-       
-        GLib.timeout_add_seconds(5, disable_pairable)
+        # Best-effort bluetoothctl trust (keeps BlueZ cache consistent)
+        try:
+            result = subprocess.run(
+                ["bluetoothctl", "--", "trust", mac],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if result.returncode == 0:
+                print(f"✅ bluetoothctl trust: {result.stdout.strip()}")
+            else:
+                print(f"⚠️ bluetoothctl trust failed: {result.stderr.strip()}")
+        except Exception as e:
+            print(f"⚠️ bluetoothctl trust exec error: {e}")
 
-        #subprocess.run(["bluetoothctl", "--", "pairable", "off"], check=False)
-        print(f"🔒 Device trusted & pairable disabled: {mac}")
-        token_verified = True
+        # Now and only now, schedule pairable off
+        #GLib.timeout_add_seconds(5, disable_pairable)
+        #print(f"🔒 Device trusted; will disable pairable after delay for {mac}")
 
     except Exception as e:
         print(f"⚠️ Could not trust device: {e}")
         token_verified = False
 
 def disable_pairable():
-    subprocess.run(["bluetoothctl", "pairable", "off"])
-    print("🛑 Pairable mode disabled after delay")
-    return False  # GLib timeout must return False to stop repeating
+    try:
+        # Set Adapter1.Pairable = False via D-Bus
+        om = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+        objs = om.GetManagedObjects()
+        adapter_path = None
+        for p, ifaces in objs.items():
+            if "org.bluez.Adapter1" in ifaces:
+                adapter_path = p
+                break
+        if not adapter_path:
+            print("⚠️ No adapter to disable pairable on")
+            return False
+
+        adapter = bus.get_object("org.bluez", adapter_path)
+        props = dbus.Interface(adapter, "org.freedesktop.DBus.Properties")
+        props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(False))
+        print("🛑 Pairable mode disabled after delay (D-Bus)")
+    except Exception as e:
+        print(f"⚠️ Failed to disable pairable: {e}")
+    return False
 
 def trigger_alarm():
     """Sound buzzer for 3 seconds."""
@@ -232,6 +257,30 @@ class SecureCharacteristic(Characteristic):
         super().__init__(bus, index, DATA_CHAR_UUID,
                          ["read", "write", "write-without-response", "notify"], service)
         self.value = dbus.Array([], signature='y')
+        self.notifying = False
+
+  # NOTIFY
+    @dbus.service.method("org.bluez.GattCharacteristic1")
+    def StartNotify(self):
+        if self.notifying:
+            return
+        self.notifying = True
+        print("📡 Notifications started")
+        GLib.timeout_add_seconds(10, self._send_heartbeat)
+
+    @dbus.service.method("org.bluez.GattCharacteristic1")
+    def StopNotify(self):
+        self.notifying = False
+        print("🛑 Notifications stopped")
+
+    def _send_heartbeat(self):
+        if not self.notifying:
+            return False
+        # Send a trivial "ping"
+        self.PropertiesChanged("org.bluez.GattCharacteristic1",
+                               {"Value": dbus.Array([0x01], signature='y')}, [])
+        print("💓 Heartbeat notify sent")
+        return True
 
     # WRITE
     @dbus.service.method("org.bluez.GattCharacteristic1",
@@ -360,6 +409,9 @@ def properties_changed_handler(interface, changed, invalidated, path):
 
     if connected:
         print(f"🔗 Device connected: {mac}")
+        
+        
+        
         if last_trusted_mac and mac != last_trusted_mac:
             print("⚠️  Unauthorized device attempted to connect!")
             trigger_alarm()
@@ -377,9 +429,23 @@ def properties_changed_handler(interface, changed, invalidated, path):
 
         token_verified = False
         authorized_device_path = None
+        
         if mac == last_trusted_mac:
+            print(f"✅ Known trusted device {mac} reconnected")
+            authorized_device_path = path
+            token_verified = True
+            try:
+                dev = bus.get_object("org.bluez", path)
+                props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
+                if bool(props.Get("org.bluez.Device1", "Paired")):
+                    trust_device(path)
+            except Exception as e:
+                print(f"⚠️ Could not re-check Paired state: {e}")
+           
+        else:
             token_verified = False
             authorized_device_path = None
+
 
     else:
         print(f"🔌 Device disconnected: {mac}")
@@ -424,7 +490,6 @@ signal.signal(signal.SIGTERM, sigterm_handler)
 if __name__ == "__main__":
     # DBus mainloop setup
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-    enable_discoverable_pairable()
 
     # Register BlueZ agent globally (extra safety)
     bus = dbus.SystemBus()
@@ -438,6 +503,9 @@ if __name__ == "__main__":
             raise
     mgr.RequestDefaultAgent("/test/agent")
     print("🔑 Agent registered & set as default")
+    
+    # Only then enable discoverable/pairable
+    enable_discoverable_pairable()
 
     # Attach DBus property change listener
     bus.add_signal_receiver(properties_changed_handler,
