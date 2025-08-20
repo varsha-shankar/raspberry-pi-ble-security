@@ -182,8 +182,26 @@ def disable_pairable():
 def trigger_alarm():
     """Sound buzzer for 3 seconds."""
     print("🚨 Anti‑theft alarm triggered!")
-    GPIO.output(BUZZER_PIN, GPIO.HIGH)
-    GLib.timeout_add_seconds(3, lambda *_: GPIO.output(BUZZER_PIN, GPIO.LOW) or False)
+    led_blink(17, 10)
+    #GPIO.output(BUZZER_PIN, GPIO.HIGH)
+    #GLib.timeout_add_seconds(3, lambda *_: GPIO.output(BUZZER_PIN, GPIO.LOW) or False)
+        
+def led_contineous_glow(pin_number, timer):
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(pin_number, GPIO.OUT)
+    GPIO.output(pin_number, GPIO.HIGH)
+    time.sleep(timer)
+    GPIO.output(pin_number, GPIO.LOW)
+
+def led_blink(pin_number, timer):
+    end_time = time.time() + timer
+    while time.time() < end_time:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(pin_number, GPIO.OUT)
+        GPIO.output(pin_number, GPIO.HIGH)
+        time.sleep(0.2)
+        GPIO.output(pin_number, GPIO.LOW)
+        time.sleep(0.2)
 
 # -----------------------------
 # BLE Advertisement wrapper
@@ -241,6 +259,8 @@ class TokenCharacteristic(Characteristic):
             token_verified = True
             authorized_device_path = device
             trust_device(device)
+            led_contineous_glow(18, 5)
+            
             # ... your access-granted code ...
         else:
             print(f"⛔ Invalid TOTP. Access denied.")
@@ -255,7 +275,7 @@ class SecureCharacteristic(Characteristic):
 
     def __init__(self, bus, index, service):
         super().__init__(bus, index, DATA_CHAR_UUID,
-                         ["read", "write", "write-without-response"], service)
+                         ["read", "write","write-without-response", "notify"], service)
         self.value = dbus.Array([], signature='y')
         self.notifying = False
 
@@ -289,6 +309,7 @@ class SecureCharacteristic(Characteristic):
         device = options.get("device")
         if not token_verified or device != authorized_device_path:
             print(f"⛔ Unauthorized write attempt from {path_to_mac(device)}")
+            trigger_alarm()
             raise dbus.exceptions.DBusException("org.bluez.Error.NotAuthorized",
                                                 "Write not permitted")
         self.value = value
@@ -303,6 +324,7 @@ class SecureCharacteristic(Characteristic):
         device = options.get("device")
         if not token_verified or device != authorized_device_path:
             print(f"⛔ Unauthorized read attempt from {path_to_mac(device)}")
+            trigger_alarm()
             raise dbus.exceptions.DBusException("org.bluez.Error.NotAuthorized",
                                                 "Read not permitted")
         print("✅ Authorized read")
