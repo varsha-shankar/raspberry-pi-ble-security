@@ -31,20 +31,31 @@ import os
 import RPi.GPIO as GPIO
 
 from advertisement import Advertisement
-from service import Application, Service, Characteristic
+from service import Application, Service, Characteristic, TwoWheelerService
 from agent import NoInputNoOutputAgent
 
 # -----------------------------
 # Configuration constants
 # ----------------------------- 
 AUTH_TOKEN = "SECRET123"          # shared secret
-SERVICE_UUID = "1234"            # primary service
-TOKEN_CHAR_UUID = "abcd"         # token characteristic
-DATA_CHAR_UUID = "5678"          # secured characteristic
 LOCAL_NAME = "SecureBLEPi"        # advertisement name
 BUZZER_PIN = 18                   # GPIO pin for buzzer
 TRUSTED_DEVICE_FILE = "trusted_device.json"
 TOTP_SECRET = "JBSWY3DPEHPK3PXP"  # 🔐 base32-encoded TOTP secret (same on Pi + app)
+
+# --- UUIDs: use full 128-bit ---
+SERVICE_UUID          = "00001234-0000-1000-8000-00805f9b34fb"  # anti-theft service
+TOKEN_CHAR_UUID       = "0000abcd-0000-1000-8000-00805f9b34fb"  # token (write)
+DATA_CHAR_UUID        = "00005678-0000-1000-8000-00805f9b34fb"  # secured read/write
+
+# Two-wheeler simulator service + characteristics (examples)
+TWO_WHEELER_SERVICE_UUID = "12345678-1234-5678-1234-56789abcde00"
+IGNITION_UUID            = "12345678-1234-5678-1234-56789abcde01"
+BATTERY_UUID             = "12345678-1234-5678-1234-56789abcde02"
+ODOMETER_UUID            = "12345678-1234-5678-1234-56789abcde03"
+SPEED_UUID               = "12345678-1234-5678-1234-56789abcde04"
+MODE_UUID                = "12345678-1234-5678-1234-56789abcde05"
+COMMAND_UUID             = "12345678-1234-5678-1234-56789abcde06"
 
 # -----------------------------
 # Global state flags
@@ -198,6 +209,7 @@ def led_blink(pin_number, timer):
     while time.time() < end_time:
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(pin_number, GPIO.OUT)
+        #GPIO.output(BUZZER_PIN, GPIO.HIGH)
         GPIO.output(pin_number, GPIO.HIGH)
         time.sleep(0.2)
         GPIO.output(pin_number, GPIO.LOW)
@@ -208,9 +220,10 @@ def led_blink(pin_number, timer):
 # -----------------------------
 
 class BluetoothAdvertisement(Advertisement):
-    def __init__(self, bus, index):
+    def __init__(self, bus, index, service_uuids=None):
         super().__init__(bus, index, "peripheral")
         self.add_service_uuid(SERVICE_UUID)
+        self.add_service_uuid(TWO_WHEELER_SERVICE_UUID)
         self.add_local_name(LOCAL_NAME)
         self.include_tx_power = True
 
@@ -350,6 +363,7 @@ class BluetoothApplication:
         self.bus = dbus.SystemBus()
         bus = self.bus  # expose to helpers
         self.app = Application(self.bus)
+    
         self.ad_manager = None
         self.service_manager = None
         self.adapter_path = self._find_adapter()
@@ -379,8 +393,11 @@ class BluetoothApplication:
     # ---- Advertising helpers ----
     def start_advertising(self):
         self.ad_index += 1
-        self.adv = BluetoothAdvertisement(self.bus, self.ad_index)
-        print(f"📢 Start advertising (index {self.ad_index})")
+        # Pass in BOTH service UUIDs so they show up in the advertising packet
+        service_uuids = [SERVICE_UUID, TWO_WHEELER_SERVICE_UUID]
+        self.adv = BluetoothAdvertisement(self.bus, self.ad_index, service_uuids)
+        print(f"📢 Start advertising (index {self.ad_index}) with UUIDs {service_uuids}")
+        #self.adv = BluetoothAdvertisement(self.bus, self.ad_index)
         self.ad_manager.RegisterAdvertisement(
             self.adv.get_path(), {},
             reply_handler=lambda: print("✅ Advertisement registered"),
@@ -401,6 +418,12 @@ class BluetoothApplication:
         service = BluetoothService(self.bus, 0)
         print(f"🔧 Registering service UUID: {SERVICE_UUID}")
         self.app.add_service(service)
+
+        self.two_wheeler_service = TwoWheelerService(self.bus, 1)
+        print("🏍️ Registering TwoWheelerService (ignition, battery, odometer, speed)")
+        self.app.add_service(self.two_wheeler_service)
+        
+        # Register whole GATT application (all services together)
         self.app.register()
         # small delay to ensure GATT is ready
         time.sleep(1)
