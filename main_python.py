@@ -193,7 +193,7 @@ def disable_pairable():
 def trigger_alarm():
     """Sound buzzer for 3 seconds."""
     print("🚨 Anti‑theft alarm triggered!")
-    led_blink(17, 10)
+    led_blink(17, 2)
     #GPIO.output(BUZZER_PIN, GPIO.HIGH)
     #GLib.timeout_add_seconds(3, lambda *_: GPIO.output(BUZZER_PIN, GPIO.LOW) or False)
         

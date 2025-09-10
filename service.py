@@ -45,17 +45,17 @@ CHAR_UUIDS = {
 
 CHAR_PROPERTIES = {
     TwoWheelerCharID.IGNITION_STATE:  CharProperty.READWRITE,
-    TwoWheelerCharID.BATTERY_VOLTAGE: CharProperty.READ,
+    TwoWheelerCharID.BATTERY_VOLTAGE: CharProperty.READWRITE,
     TwoWheelerCharID.ODOMETER_VALUE:  CharProperty.READWRITE,
-    TwoWheelerCharID.ENGINE_TEMP:     CharProperty.READ,
-    TwoWheelerCharID.FUEL_LEVEL:      CharProperty.READ,
+    TwoWheelerCharID.ENGINE_TEMP:     CharProperty.READWRITE,
+    TwoWheelerCharID.FUEL_LEVEL:      CharProperty.READWRITE,
     TwoWheelerCharID.SPEED:           CharProperty.READWRITE,
 }
 
 # Simulator state
 char_values = {
     TwoWheelerCharID.IGNITION_STATE:  False,
-    TwoWheelerCharID.BATTERY_VOLTAGE: 12.6,
+    TwoWheelerCharID.BATTERY_VOLTAGE: 15,
     TwoWheelerCharID.ODOMETER_VALUE:  12345,
     TwoWheelerCharID.ENGINE_TEMP:     75.0,
     TwoWheelerCharID.FUEL_LEVEL:      55,
@@ -246,6 +246,10 @@ class TwoWheelerCharacteristic(Characteristic):
     def ReadValue(self, options):
         value = char_values[self.char_id]
         if isinstance(value, bool):
+            if value==True:
+                print("Ignition is ON")
+            elif value==False:
+                print("Ignistion is OFF")     
             return [dbus.Byte(1 if value else 0)]
         elif isinstance(value, int):
             return [dbus.Byte((value >> (8 * i)) & 0xFF) for i in range(4)]
@@ -260,9 +264,24 @@ class TwoWheelerCharacteristic(Characteristic):
             raise NotSupportedException()
         if self.char_id == TwoWheelerCharID.IGNITION_STATE:
             char_values[self.char_id] = bool(value[0])
-        elif self.char_id in (TwoWheelerCharID.ODOMETER_VALUE, TwoWheelerCharID.SPEED):
+            if bool(value[0]) == True:
+                print("Turning on the Ignition")
+            else:
+                print("Turning off the Ignition")
+        elif self.char_id == (TwoWheelerCharID.ODOMETER_VALUE):
             new_val = int.from_bytes(value, byteorder="little")
+            print("Odometer value (Km) : "+bytes(value).decode('utf-8'))
             char_values[self.char_id] = new_val
+        elif self.char_id == (TwoWheelerCharID.BATTERY_VOLTAGE):
+            print("Battery Voltage : "+bytes(value).decode('utf-8')+" V")
+        elif self.char_id == (TwoWheelerCharID.ENGINE_TEMP):
+            print("Engine Temperature : "+bytes(value).decode('utf-8')+" degree Celsius")
+        elif self.char_id == (TwoWheelerCharID.FUEL_LEVEL):
+            print("Fuel Level : "+bytes(value).decode('utf-8')+" ltrs")
+        elif self.char_id == (TwoWheelerCharID.SPEED):
+            print("Vehicle speed : "+bytes(value).decode('utf-8')+" Kmh")
+        else:
+            print("Please enter a proper data")
 
 class TwoWheelerService(Service):
     def __init__(self, bus, index):
