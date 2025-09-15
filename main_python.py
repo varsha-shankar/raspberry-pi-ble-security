@@ -1,20 +1,11 @@
-# main_python.py — full working BLE anti‑theft script with token‑based authorization
-# Author: Varsha Shankar (July 2025)
+#!/usr/bin/env python3
+# main_python.py — full working BLE anti-theft script with token-based authorization
+# Author: Varsha Shankar (July 2025) — extended with iBeacon beaconing (rolling HMAC)
 # ------------------------------------------------------------
-# External files required in the same folder:
-#   • advertisement.py  – contains Advertisement base‑class
-#   • service.py        – contains Application, Service, Characteristic base‑classes
+# External files required in the same folder:
+#   • advertisement.py  – contains Advertisement base-class (must include add_manufacturer_data)
+#   • service.py        – contains Application, Service, Characteristic base-classes
 #   • agent.py          – contains NoInputNoOutputAgent class
-# ------------------------------------------------------------
-# This script provides:
-#   • BLE peripheral advertising a primary service 1234
-#   • Two characteristics inside that service:
-#       – abcd : write‑only   → client sends secret token here
-#       – 5678 : read / write → unlocked only after valid token
-#   • Auto pairing via BlueZ Agent, device auto‑trusted after token match
-#   • Anti‑theft alarm (GPIO buzzer on pin 18) when trusted device disconnects
-#   • Auto‑restart advertising after disconnect
-#   • Clean shutdown & GPIO cleanup on Ctrl‑C
 # ------------------------------------------------------------
 
 import dbus
@@ -33,6 +24,9 @@ import RPi.GPIO as GPIO
 from advertisement import Advertisement
 from service import Application, Service, Characteristic, TwoWheelerService
 from agent import NoInputNoOutputAgent
+
+# New imports for beaconing
+import struct, hmac, hashlib
 
 # -----------------------------
 # Configuration constants
@@ -56,6 +50,16 @@ ODOMETER_UUID            = "12345678-1234-5678-1234-56789abcde03"
 SPEED_UUID               = "12345678-1234-5678-1234-56789abcde04"
 MODE_UUID                = "12345678-1234-5678-1234-56789abcde05"
 COMMAND_UUID             = "12345678-1234-5678-1234-56789abcde06"
+
+# ------------- Beaconing config -------------
+# We'll use the SERVICE_UUID as the iBeacon UUID so the app can correlate service <-> beacon.
+IBEACON_COMPANY_ID = 0x004C   # Apple company ID for iBeacon manufacturer data
+BEACON_UUID = SERVICE_UUID
+SHARED_SECRET = b"super_secret_key"  # Must match Flutter app's secret; keep secure
+TOKEN_WINDOW = 30               # seconds per rolling token
+TOKEN_TRUNC_BYTES = 2          # truncate HMAC to this many bytes (2 bytes -> 16 bits in minor)
+TX_POWER = -59                 # measured RSSI at 1m (signed byte)
+# --------------------------------------------
 
 # -----------------------------
 # Global state flags
@@ -93,11 +97,14 @@ except Exception as e:
 
 def path_to_mac(path: str) -> str:
     """Convert BlueZ device object path to MAC string."""
-    print("path to mac ====",path.split("/")[-1].replace("dev_", "").replace("_", ":"))
-    return path.split("/")[-1].replace("dev_", "").replace("_", ":")
+    # Example path: /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF
+    try:
+        return path.split("/")[-1].replace("dev_", "").replace("_", ":")
+    except Exception:
+        return str(path)
 
 def save_trusted_device(device_id):
-    print("save trsuted device called and the id ===",device_id)
+    print("save trusted device called and the id ===",device_id)
     with open(TRUSTED_DEVICE_FILE,"w") as f:
         json.dump({"device_id":device_id},f)
 
@@ -160,10 +167,6 @@ def trust_device(device_path: str):
         except Exception as e:
             print(f"⚠️ bluetoothctl trust exec error: {e}")
 
-        # Now and only now, schedule pairable off
-        #GLib.timeout_add_seconds(5, disable_pairable)
-        #print(f"🔒 Device trusted; will disable pairable after delay for {mac}")
-
     except Exception as e:
         print(f"⚠️ Could not trust device: {e}")
         token_verified = False
@@ -191,8 +194,8 @@ def disable_pairable():
     return False
 
 def trigger_alarm():
-    """Sound buzzer for 3 seconds."""
-    print("🚨 Anti‑theft alarm triggered!")
+    """Sound buzzer for 3 seconds."""
+    print("🚨 Anti-theft alarm triggered!")
     led_blink(17, 2)
     #GPIO.output(BUZZER_PIN, GPIO.HIGH)
     #GLib.timeout_add_seconds(3, lambda *_: GPIO.output(BUZZER_PIN, GPIO.LOW) or False)
@@ -222,17 +225,20 @@ def led_blink(pin_number, timer):
 class BluetoothAdvertisement(Advertisement):
     def __init__(self, bus, index, service_uuids=None):
         super().__init__(bus, index, "peripheral")
+        # keep existing behaviour: add your service UUIDs and local name
         self.add_service_uuid(SERVICE_UUID)
         self.add_service_uuid(TWO_WHEELER_SERVICE_UUID)
         self.add_local_name(LOCAL_NAME)
         self.include_tx_power = True
+        # manufacturer data is attached by the application when creating adv
+        # (we attach dynamic manufacturer payload in BluetoothApplication.start_advertising)
 
 # -----------------------------
 # GATT Characteristics
 # -----------------------------
 
 class TokenCharacteristic(Characteristic):
-    """Write‑only characteristic to receive the secret token."""
+    """Write-only characteristic to receive the secret token."""
 
     def __init__(self, bus, index, service):
         super().__init__(bus, index, TOKEN_CHAR_UUID,
@@ -241,18 +247,11 @@ class TokenCharacteristic(Characteristic):
     @dbus.service.method("org.bluez.GattCharacteristic1",
                          in_signature="aya{sv}", out_signature="")
     def WriteValue(self, value, options):
-        print("write value called on toekn characteristics")
+        print("write value called on token characteristic")
         global authorized_device_path, token_verified
         device = options.get("device")
         device_address = path_to_mac(device)
         
-          # ✅ If device is already trusted, skip TOTP
-#         if mac == last_trusted_mac:
-#             print(f"✅ {mac} is already trusted. Skipping TOTP check.")
-#             token_verified = True
-#             authorized_device_path = device
-#             return
-               
         token = bytes(value).decode("utf-8", errors="ignore").strip()
         print(f"🔑 Token received from {path_to_mac(device)} → '{token}'")
         
@@ -292,7 +291,7 @@ class SecureCharacteristic(Characteristic):
         self.value = dbus.Array([], signature='y')
         self.notifying = False
 
-  # NOTIFY
+    # NOTIFY
     @dbus.service.method("org.bluez.GattCharacteristic1")
     def StartNotify(self):
         if self.notifying:
@@ -372,6 +371,7 @@ class BluetoothApplication:
         self._attach_managers()
         self.ad_index = 0
         self.adv = None
+        self.adv_timer_id = None
 
     def _find_adapter(self):
         om = dbus.Interface(self.bus.get_object("org.bluez", "/"),
@@ -392,16 +392,70 @@ class BluetoothApplication:
 
     # ---- Advertising helpers ----
     def start_advertising(self):
+        """Start advertisement and schedule periodic refresh to update rolling token."""
+        # Ensure any previous adv removed
+        self.stop_advertising()
+
         self.ad_index += 1
         # Pass in BOTH service UUIDs so they show up in the advertising packet
         service_uuids = [SERVICE_UUID, TWO_WHEELER_SERVICE_UUID]
         self.adv = BluetoothAdvertisement(self.bus, self.ad_index, service_uuids)
+        # Attach dynamic iBeacon manufacturer data (rolling token embedded in minor)
+        try:
+            self.adv.add_manufacturer_data(IBEACON_COMPANY_ID, build_ibeacon_payload())
+        except Exception as e:
+            print(f"⚠️ Failed to attach manufacturer data: {e}")
+
         print(f"📢 Start advertising (index {self.ad_index}) with UUIDs {service_uuids}")
-        #self.adv = BluetoothAdvertisement(self.bus, self.ad_index)
         self.ad_manager.RegisterAdvertisement(
             self.adv.get_path(), {},
             reply_handler=lambda: print("✅ Advertisement registered"),
             error_handler=lambda e: print(f"❌ Ad register error: {e}"))
+
+        # Schedule refresh to rotate token and update adv (returns True to keep timer)
+        # Remove any old timer
+        if self.adv_timer_id:
+            try:
+                GLib.source_remove(self.adv_timer_id)
+            except Exception:
+                pass
+            self.adv_timer_id = None
+
+        # Schedule refresh at TOKEN_WINDOW seconds
+        self.adv_timer_id = GLib.timeout_add_seconds(TOKEN_WINDOW, self._refresh_advertisement)
+
+    def _refresh_advertisement(self):
+        """Called periodically to replace advertisement with a new token-bearing adv."""
+        print("🔁 Refreshing advertisement with new rolling token")
+        try:
+            # Unregister previous ad (if any)
+            if self.adv:
+                try:
+                    self.ad_manager.UnregisterAdvertisement(self.adv.get_path())
+                    print("🛑 Previous advertisement unregistered for refresh")
+                except Exception as e:
+                    print(f"⚠️ Could not unregister previous advertisement: {e}")
+                # allow small gap
+                time.sleep(0.1)
+
+            # Create and register a fresh advertisement (index incremented to avoid dbus path clash)
+            self.ad_index += 1
+            self.adv = BluetoothAdvertisement(self.bus, self.ad_index)
+            try:
+                self.adv.add_manufacturer_data(IBEACON_COMPANY_ID, build_ibeacon_payload())
+            except Exception as e:
+                print(f"⚠️ Failed to attach manufacturer data on refresh: {e}")
+
+            self.ad_manager.RegisterAdvertisement(
+                self.adv.get_path(), {},
+                reply_handler=lambda: print("✅ Advertisement registered (refreshed)"),
+                error_handler=lambda e: print(f"❌ Ad register error (refresh): {e}"))
+
+        except Exception as e:
+            print(f"⚠️ Error while refreshing advertisement: {e}")
+
+        # Keep the timeout repeating
+        return True
 
     def stop_advertising(self):
         if self.adv:
@@ -412,6 +466,13 @@ class BluetoothApplication:
                 # Already removed or never registered
                 print(f"⚠️  Ad unregister: {e}")
             self.adv = None
+        # Cancel timer if present
+        if self.adv_timer_id:
+            try:
+                GLib.source_remove(self.adv_timer_id)
+            except Exception:
+                pass
+            self.adv_timer_id = None
 
     # ---- Run / cleanup ----
     def run(self):
@@ -444,7 +505,7 @@ class BluetoothApplication:
 # -----------------------------
 
 def properties_changed_handler(interface, changed, invalidated, path):
-    global token_verified, authorized_device_path, last_trusted_mac
+    global token_verified, authorized_device_path, last_trusted_mac, app
 
     if interface != "org.bluez.Device1" or "Connected" not in changed:
         return
@@ -480,25 +541,31 @@ def properties_changed_handler(interface, changed, invalidated, path):
 
 
     if mac == last_trusted_mac:
-            print(f"✅ Known trusted device {mac} reconnected")
-            authorized_device_path = path
-            token_verified = True
-            try:
-                if bool(props.Get("org.bluez.Device1", "Paired")):
-                    trust_device(path)
-            except Exception as e:
-                print(f"⚠️ Could not re-check Paired state: {e}")
+        print(f"✅ Known trusted device {mac} reconnected")
+        authorized_device_path = path
+        token_verified = True
+        try:
+            dev = bus.get_object("org.bluez", path)
+            props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
+            if bool(props.Get("org.bluez.Device1", "Paired")):
+                trust_device(path)
+        except Exception as e:
+            print(f"⚠️ Could not re-check Paired state: {e}")
 
     else:
-        print(f"🔌 Device disconnected: {mac}")
+        # Disconnected branch (or other device connected)
+        print(f"🔌 Device disconnected or not trusted: {mac}")
         if path == authorized_device_path and token_verified:
             trigger_alarm()
         token_verified = False
         authorized_device_path = None
-        app.stop_advertising()
-        app.start_advertising()
-
-
+        # restart advertising to refresh any session state
+        if app:
+            try:
+                app.stop_advertising()
+                app.start_advertising()
+            except Exception as e:
+                print(f"⚠️ error restarting advertising: {e}")
 
 # -----------------------------
 # Pairable / discoverable helper at startup
@@ -512,7 +579,7 @@ def enable_discoverable_pairable():
     print("✅ Pi set to discoverable & pairable (temporary)")
 
 # -----------------------------
-# Signal handlers (Ctrl‑C)
+# Signal handlers (Ctrl-C)
 # -----------------------------
 
 def sigterm_handler(sig, frame):
@@ -525,6 +592,32 @@ def sigterm_handler(sig, frame):
 
 signal.signal(signal.SIGINT, sigterm_handler)
 signal.signal(signal.SIGTERM, sigterm_handler)
+
+# -----------------------------
+# Beacon helper functions (rolling HMAC token -> iBeacon minor)
+# -----------------------------
+def rolling_token(window=TOKEN_WINDOW, trunc_bytes=TOKEN_TRUNC_BYTES):
+    """Return integer token truncated from HMAC-SHA256(secret, bucket)."""
+    bucket = int(time.time()) // window
+    hm = hmac.new(SHARED_SECRET, str(bucket).encode(), hashlib.sha256).digest()
+    return int.from_bytes(hm[:trunc_bytes], byteorder='big')
+
+def build_ibeacon_payload():
+    """
+    iBeacon manufacturer data layout:
+    [0..1]   = 0x0215 (iBeacon indicator)
+    [2..17]  = 16-byte UUID
+    [18..19] = major (2 bytes)
+    [20..21] = minor (2 bytes)  <- rolling token here
+    [22]     = tx power (1 byte signed)
+    """
+    uuid_bytes = bytes.fromhex(BEACON_UUID.replace("-", ""))
+    if len(uuid_bytes) != 16:
+        raise ValueError("UUID must be 16 bytes after removing hyphens")
+    major = 1
+    minor = rolling_token()
+    payload = struct.pack(">H16sHHb", 0x0215, uuid_bytes, major, minor, TX_POWER)
+    return list(payload)
 
 # -----------------------------
 # Main entry point
