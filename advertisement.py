@@ -54,10 +54,16 @@ class Advertisement(dbus.service.Object):
             self.service_uuids = []
         self.service_uuids.append(uuid)
 
-    def add_manufacturer_data(self, manuf_code, data):
+    def add_manufacturer_data(self, manuf_code, data_bytes):
         if not self.manufacturer_data:
-            self.manufacturer_data = dbus.Dictionary({}, signature='qv')
-        self.manufacturer_data[manuf_code] = dbus.Array(data, signature='y')
+            self.manufacturer_data = {}
+        self.manufacturer_data[dbus.UInt16(manuf_code)] = dbus.Array(data_bytes, signature='y')
+
+
+    # def add_manufacturer_data(self, manuf_code, data):
+    #     if not self.manufacturer_data:
+    #         self.manufacturer_data = dbus.Dictionary({}, signature='qv')
+    #     self.manufacturer_data[manuf_code] = dbus.Array(data, signature='y')
 
     def add_solicit_uuid(self, uuid):
         if not self.solicit_uuids:
