@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 # main_python.py — full working BLE anti-theft script with token-based authorization
-# Author: Varsha Shankar (July 2025) — extended with iBeacon beaconing (rolling HMAC)
+# Author: Varsha Shankar (July 2025)
 # ------------------------------------------------------------
 # External files required in the same folder:
 #   • advertisement.py  – contains Advertisement base-class (must include add_manufacturer_data)
 #   • service.py        – contains Application, Service, Characteristic base-classes
 #   • agent.py          – contains NoInputNoOutputAgent class
+# ------------------------------------------------------------
+# This script provides:
+#   • BLE peripheral advertising a primary service 1234
+#   • Two characteristics inside that service:
+#       – abcd : write-only   → client sends secret token here
+#       – 5678 : read / write → unlocked only after valid token
+#   • Auto pairing via BlueZ Agent, device auto-trusted after token match
+#   • Anti-theft alarm (GPIO buzzer on pin 18) when trusted device disconnects
+#   • Auto-restart advertising after disconnect
+#   • Clean shutdown & GPIO cleanup on Ctrl-C
 # ------------------------------------------------------------
 
 import dbus
@@ -24,9 +34,6 @@ import RPi.GPIO as GPIO
 from advertisement import Advertisement
 from service import Application, Service, Characteristic, TwoWheelerService
 from agent import NoInputNoOutputAgent
-
-# New imports for beaconing
-import struct, hmac, hashlib
 
 # -----------------------------
 # Configuration constants
@@ -51,15 +58,18 @@ SPEED_UUID               = "12345678-1234-5678-1234-56789abcde04"
 MODE_UUID                = "12345678-1234-5678-1234-56789abcde05"
 COMMAND_UUID             = "12345678-1234-5678-1234-56789abcde06"
 
-# ------------- Beaconing config -------------
-# We'll use the SERVICE_UUID as the iBeacon UUID so the app can correlate service <-> beacon.
-IBEACON_COMPANY_ID = 0x004C   # Apple company ID for iBeacon manufacturer data
-BEACON_UUID = SERVICE_UUID
-SHARED_SECRET = b"super_secret_key"  # Must match Flutter app's secret; keep secure
-TOKEN_WINDOW = 30               # seconds per rolling token
-TOKEN_TRUNC_BYTES = 2          # truncate HMAC to this many bytes (2 bytes -> 16 bits in minor)
-TX_POWER = -59                 # measured RSSI at 1m (signed byte)
-# --------------------------------------------
+# -----------------------------
+# Beaconing config (iBeacon with rolling HMAC token)
+# -----------------------------
+import struct, hmac, hashlib
+
+IBEACON_COMPANY_ID = 0x004C   # Apple company ID for iBeacon
+BEACON_UUID = SERVICE_UUID    # use the same UUID for correlation
+SHARED_SECRET = b"super_secret_key"  # must match phone app
+TOKEN_WINDOW = 30             # seconds per token step
+TOKEN_TRUNC_BYTES = 2         # 2 bytes -> fits into iBeacon minor (16-bit)
+TX_POWER = -59                # measured power at 1m (signed byte)
+# -----------------------------
 
 # -----------------------------
 # Global state flags
@@ -97,7 +107,6 @@ except Exception as e:
 
 def path_to_mac(path: str) -> str:
     """Convert BlueZ device object path to MAC string."""
-    # Example path: /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF
     try:
         return path.split("/")[-1].replace("dev_", "").replace("_", ":")
     except Exception:
@@ -225,13 +234,10 @@ def led_blink(pin_number, timer):
 class BluetoothAdvertisement(Advertisement):
     def __init__(self, bus, index, service_uuids=None):
         super().__init__(bus, index, "peripheral")
-        # keep existing behaviour: add your service UUIDs and local name
         self.add_service_uuid(SERVICE_UUID)
         self.add_service_uuid(TWO_WHEELER_SERVICE_UUID)
         self.add_local_name(LOCAL_NAME)
         self.include_tx_power = True
-        # manufacturer data is attached by the application when creating adv
-        # (we attach dynamic manufacturer payload in BluetoothApplication.start_advertising)
 
 # -----------------------------
 # GATT Characteristics
@@ -392,15 +398,12 @@ class BluetoothApplication:
 
     # ---- Advertising helpers ----
     def start_advertising(self):
-        """Start advertisement and schedule periodic refresh to update rolling token."""
-        # Ensure any previous adv removed
-        self.stop_advertising()
-
         self.ad_index += 1
         # Pass in BOTH service UUIDs so they show up in the advertising packet
         service_uuids = [SERVICE_UUID, TWO_WHEELER_SERVICE_UUID]
+        # Create adv object (it exposes GetAll so BlueZ reads properties)
         self.adv = BluetoothAdvertisement(self.bus, self.ad_index, service_uuids)
-        # Attach dynamic iBeacon manufacturer data (rolling token embedded in minor)
+        # Attach iBeacon manufacturer data (rolling token)
         try:
             self.adv.add_manufacturer_data(IBEACON_COMPANY_ID, build_ibeacon_payload())
         except Exception as e:
@@ -412,8 +415,7 @@ class BluetoothApplication:
             reply_handler=lambda: print("✅ Advertisement registered"),
             error_handler=lambda e: print(f"❌ Ad register error: {e}"))
 
-        # Schedule refresh to rotate token and update adv (returns True to keep timer)
-        # Remove any old timer
+        # Schedule refresh to rotate token and update adv (in-place update)
         if self.adv_timer_id:
             try:
                 GLib.source_remove(self.adv_timer_id)
@@ -421,41 +423,27 @@ class BluetoothApplication:
                 pass
             self.adv_timer_id = None
 
-        # Schedule refresh at TOKEN_WINDOW seconds
         self.adv_timer_id = GLib.timeout_add_seconds(TOKEN_WINDOW, self._refresh_advertisement)
 
     def _refresh_advertisement(self):
-        """Called periodically to replace advertisement with a new token-bearing adv."""
-        print("🔁 Refreshing advertisement with new rolling token")
+        """Update the manufacturer data in the existing advertisement (no unregister/register)."""
+        if not self.adv:
+            return True  # keep timer alive; nothing to do
+
         try:
-            # Unregister previous ad (if any)
-            if self.adv:
-                try:
-                    self.ad_manager.UnregisterAdvertisement(self.adv.get_path())
-                    print("🛑 Previous advertisement unregistered for refresh")
-                except Exception as e:
-                    print(f"⚠️ Could not unregister previous advertisement: {e}")
-                # allow small gap
-                time.sleep(0.1)
-
-            # Create and register a fresh advertisement (index incremented to avoid dbus path clash)
-            self.ad_index += 1
-            self.adv = BluetoothAdvertisement(self.bus, self.ad_index)
+            new_payload = build_ibeacon_payload()
+            # Replace manufacturer data in-place
+            self.adv.add_manufacturer_data(IBEACON_COMPANY_ID, new_payload)
+            # Log token (minor) for debugging (last two bytes before tx power)
             try:
-                self.adv.add_manufacturer_data(IBEACON_COMPANY_ID, build_ibeacon_payload())
-            except Exception as e:
-                print(f"⚠️ Failed to attach manufacturer data on refresh: {e}")
-
-            self.ad_manager.RegisterAdvertisement(
-                self.adv.get_path(), {},
-                reply_handler=lambda: print("✅ Advertisement registered (refreshed)"),
-                error_handler=lambda e: print(f"❌ Ad register error (refresh): {e}"))
-
+                minor = (new_payload[20] << 8) | new_payload[21]
+                print(f"🔁 Advertisement refreshed with new rolling token (minor={minor})")
+            except Exception:
+                print("🔁 Advertisement refreshed (token updated)")
         except Exception as e:
-            print(f"⚠️ Error while refreshing advertisement: {e}")
+            print(f"⚠️ Failed to refresh advertisement: {e}")
 
-        # Keep the timeout repeating
-        return True
+        return True  # repeat timer
 
     def stop_advertising(self):
         if self.adv:
@@ -463,7 +451,6 @@ class BluetoothApplication:
                 self.ad_manager.UnregisterAdvertisement(self.adv.get_path())
                 print("🛑 Advertisement unregistered")
             except Exception as e:
-                # Already removed or never registered
                 print(f"⚠️  Ad unregister: {e}")
             self.adv = None
         # Cancel timer if present
@@ -505,7 +492,7 @@ class BluetoothApplication:
 # -----------------------------
 
 def properties_changed_handler(interface, changed, invalidated, path):
-    global token_verified, authorized_device_path, last_trusted_mac, app
+    global token_verified, authorized_device_path, last_trusted_mac
 
     if interface != "org.bluez.Device1" or "Connected" not in changed:
         return
@@ -541,31 +528,23 @@ def properties_changed_handler(interface, changed, invalidated, path):
 
 
     if mac == last_trusted_mac:
-        print(f"✅ Known trusted device {mac} reconnected")
-        authorized_device_path = path
-        token_verified = True
-        try:
-            dev = bus.get_object("org.bluez", path)
-            props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
-            if bool(props.Get("org.bluez.Device1", "Paired")):
-                trust_device(path)
-        except Exception as e:
-            print(f"⚠️ Could not re-check Paired state: {e}")
+            print(f"✅ Known trusted device {mac} reconnected")
+            authorized_device_path = path
+            token_verified = True
+            try:
+                if bool(props.Get("org.bluez.Device1", "Paired")):
+                    trust_device(path)
+            except Exception as e:
+                print(f"⚠️ Could not re-check Paired state: {e}")
 
     else:
-        # Disconnected branch (or other device connected)
-        print(f"🔌 Device disconnected or not trusted: {mac}")
+        print(f"🔌 Device disconnected: {mac}")
         if path == authorized_device_path and token_verified:
             trigger_alarm()
         token_verified = False
         authorized_device_path = None
-        # restart advertising to refresh any session state
-        if app:
-            try:
-                app.stop_advertising()
-                app.start_advertising()
-            except Exception as e:
-                print(f"⚠️ error restarting advertising: {e}")
+        app.stop_advertising()
+        app.start_advertising()
 
 # -----------------------------
 # Pairable / discoverable helper at startup
