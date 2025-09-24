@@ -15,7 +15,7 @@ import hmac
 import hashlib
 import json
 import pyotp
-import bluetooth
+# import bluetooth
 import RPi.GPIO as GPIO
 
 from advertisement import Advertisement
