@@ -66,6 +66,8 @@ import time
 #     GPIO.cleanup()
 
 
+
+#####gpiozero option for button click
 button = Button(27, bounce_time=0.2)
 
 def on_button_pressed():
@@ -75,7 +77,7 @@ def on_button_pressed():
     status = True
     if status:
         print("Status is True")
-        #led_contineous_glow(27,0.2)
+        led_contineous_glow(17,0.2)
     else:
         print("Status is False")
         
@@ -86,8 +88,49 @@ def led_contineous_glow(pin_number, timer):
     time.sleep(timer)
     GPIO.output(pin_number, GPIO.LOW)
     time.sleep(timer)
-    GPIO.cleanup()
+    #GPIO.cleanup()
 
 button.when_pressed = on_button_pressed
 
 pause()
+
+
+
+# # Define the GPIO pins we are using (BCM numbering)
+# led_pin = 17
+# button_pin = 27
+# 
+# def button_callback(channel):
+#     """This function is called when a button press is detected."""
+#     print(f"Button on pin {channel} was pushed!")
+#     
+#     # Turn LED on for 0.2 seconds, then turn it off
+#     GPIO.output(led_pin, GPIO.HIGH)
+#     time.sleep(0.2)
+#     GPIO.output(led_pin, GPIO.LOW)
+# 
+# # --- Main Program ---
+# try:
+#     # This line disables the channel-in-use warning
+#     GPIO.setwarnings(False)
+# 
+#     # NEW: Clean up any old configurations before starting
+#     GPIO.cleanup() 
+#     
+#     # Set the GPIO numbering mode
+#     GPIO.setmode(GPIO.BCM)
+# 
+#     # Setup the LED and Button pins
+#     GPIO.setup(led_pin, GPIO.OUT)
+#     GPIO.setup(button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+# 
+#     # Add the event detector
+#     GPIO.add_event_detect(button_pin, GPIO.FALLING, callback=button_callback, bouncetime=200)
+# 
+#     print("System ready. Press Enter to exit.")
+#     input() # Wait for user to press Enter
+# 
+# finally:
+#     # This will run on a clean exit.
+#     print("Cleaning up GPIO...")
+#     GPIO.cleanup()
