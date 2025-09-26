@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # main_python.py — BLE anti-theft system with owner/stranger logic
 
+from gpiozero.pins.pigpio import PiGPIOFactory
+from gpiozero import Button, DigitalOutputDevice
+
 import dbus
 import dbus.mainloop.glib
 import dbus.service
@@ -15,8 +18,6 @@ import hmac
 import hashlib
 import json
 import pyotp
-# import bluetooth
-import RPi.GPIO as GPIO
 
 from advertisement import Advertisement
 from service import Application, Service, Characteristic, TwoWheelerService
@@ -27,8 +28,9 @@ from agent import NoInputNoOutputAgent
 # -----------------------------
 LOCAL_NAME = "SecureBLEPi"
 BUZZER_PIN = 18
+PUSH_BUTTON_PIN = 27 # Or 23, whichever you are using
 TRUSTED_DEVICE_FILE = "trusted_device.json"
-TOTP_SECRET = "JBSWY3DPEHPK3PXP"   # base32 secret (used by phone app)
+TOTP_SECRET = "JBSWY3DPEHPK3PXP"
 
 SERVICE_UUID      = "00001234-0000-1000-8000-00805f9b34fb"
 TOKEN_CHAR_UUID   = "0000abcd-0000-1000-8000-00805f9b34fb"
@@ -43,83 +45,62 @@ TOKEN_TRUNC_BYTES = 2
 TX_POWER = -59
 
 # -----------------------------
-# Globals
+# Globals & GPIO Initialization
 # -----------------------------
 bus = None
 app = None
 authorized_device_path = None
 token_verified = False
 last_trusted_mac = None
-
 current_adv = None
 adv_refresh_id = None
-
 alarm_active = False
-
+ignition_status = False
 auto_reconnect_id = None
 last_connect_attempt = 0
-CONNECT_COOLDOWN = 20
+CONNECT_COOLDOWN = 15
 discovery_active = False
-
-# --- New guard to avoid overlapping Connect() calls ---
 connecting_attempt = False
 
-# -----------------------------
-# GPIO setup
-# -----------------------------
-GPIO.setwarnings(False)
-GPIO.setmode(GPIO.BCM)
+# --- GPIOZERO SETUP ---
 try:
-    GPIO.setup(BUZZER_PIN, GPIO.OUT)
-    GPIO.output(BUZZER_PIN, GPIO.LOW)
+    factory = PiGPIOFactory()
+    buzzer = DigitalOutputDevice(BUZZER_PIN, pin_factory=factory)
+    print(f"🔊 Buzzer initialized on GPIO {BUZZER_PIN} using pigpio factory.")
 except Exception as e:
-    print(f"⚠️  GPIO setup issue: {e}")
+    print(f"⚠️ Could not initialize pigpio factory. Is the daemon running? (sudo systemctl start pigpiod)")
+    print(f"   Error: {e}")
+    factory = None
+    buzzer = None
 
 # -----------------------------
-# Utils
+# Utils & Beacon Helpers
 # -----------------------------
 def path_to_mac(path: str) -> str:
-    try:
-        return path.split("/")[-1].replace("dev_", "").replace("_", ":")
-    except Exception:
-        return str(path)
-
+    try: return path.split("/")[-1].replace("dev_", "").replace("_", ":")
+    except Exception: return str(path)
 def load_trusted_device():
     try:
-        with open(TRUSTED_DEVICE_FILE, "r") as f:
-            return json.load(f).get("device_id")
-    except Exception:
-        return None
-
+        with open(TRUSTED_DEVICE_FILE, "r") as f: return json.load(f).get("device_id")
+    except Exception: return None
 def save_trusted_device(device_id):
     try:
-        with open(TRUSTED_DEVICE_FILE, "w") as f:
-            json.dump({"device_id": device_id}, f)
-    except Exception as e:
-        print(f"⚠️ Failed to save trusted device: {e}")
-
+        with open(TRUSTED_DEVICE_FILE, "w") as f: json.dump({"device_id": device_id}, f)
+    except Exception as e: print(f"⚠️ Failed to save trusted device: {e}")
 last_trusted_mac = load_trusted_device()
-
-# -----------------------------
-# Beacon helpers
-# -----------------------------
 def rolling_token(window=TOKEN_WINDOW, trunc_bytes=TOKEN_TRUNC_BYTES):
     bucket = int(time.time()) // window
     hm = hmac.new(SHARED_SECRET, str(bucket).encode(), hashlib.sha256).digest()
     return int.from_bytes(hm[:trunc_bytes], byteorder='big')
-
 def get_pi_major_from_mac():
     try:
-        # get BT adapter MAC
         mac = subprocess.check_output("hciconfig | grep 'BD Address'", shell=True).decode()
-        mac_addr = mac.split()[2]  # "B8:27:EB:12:34:56"
-        # use last 2 bytes for major
+        mac_addr = mac.split()[2]
         parts = mac_addr.split(":")
         return (int(parts[-2], 16) << 8) | int(parts[-1], 16)
     except Exception as e:
         print(f"⚠️ Could not get MAC, fallback major=1: {e}")
         return 1
-
 def build_ibeacon_payload():
     uuid_bytes = bytes.fromhex(BEACON_UUID.replace("-", ""))
     major = get_pi_major_from_mac()
@@ -127,9 +108,8 @@ def build_ibeacon_payload():
     payload = struct.pack(">H16sHHb", 0x0215, uuid_bytes, major, minor, TX_POWER)
     return list(payload)
 
-
 # -----------------------------
-# Advertisements
+# Advertisements, GATT Chars, BT Service & App
 # -----------------------------
 class GattAdvertisement(Advertisement):
     def __init__(self, bus, index):
@@ -137,29 +117,20 @@ class GattAdvertisement(Advertisement):
         self.add_service_uuid("1234")
         self.add_local_name(LOCAL_NAME[:8])
         self.include_tx_power = True
-
 class IBeaconAdvertisement(Advertisement):
     def __init__(self, bus, index):
         super().__init__(bus, index, "broadcast")
-        payload = build_ibeacon_payload()
-        self.add_manufacturer_data(IBEACON_COMPANY_ID, payload)
-
-# -----------------------------
-# GATT Characteristics
-# -----------------------------
+        self.add_manufacturer_data(IBEACON_COMPANY_ID, build_ibeacon_payload())
 class TokenCharacteristic(Characteristic):
     def __init__(self, bus, index, service):
         super().__init__(bus, index, TOKEN_CHAR_UUID, ["write"], service)
-
-    @dbus.service.method("org.bluez.GattCharacteristic1",
-                         in_signature="aya{sv}", out_signature="")
+    @dbus.service.method("org.bluez.GattCharacteristic1", in_signature="aya{sv}", out_signature="")
     def WriteValue(self, value, options):
         global token_verified, authorized_device_path, last_trusted_mac
         device = options.get("device")
         token = bytes(value).decode("utf-8", errors="ignore").strip()
         dev_mac = path_to_mac(device)
         print(f"🔑 Token received from {dev_mac}: {token}")
-
         totp = pyotp.TOTP(TOTP_SECRET)
         if totp.verify(token):
             print("✅ Valid TOTP. Access granted.")
@@ -172,253 +143,123 @@ class TokenCharacteristic(Characteristic):
             print("⛔ Invalid TOTP. Triggering alarm.")
             token_verified = False
             trigger_alarm()
-            
-
 class SecureCharacteristic(Characteristic):
     def __init__(self, bus, index, service):
         super().__init__(bus, index, DATA_CHAR_UUID, ["read", "write"], service)
         self.value = dbus.Array([], signature='y')
-
-    @dbus.service.method("org.bluez.GattCharacteristic1",
-                         in_signature="a{sv}", out_signature="ay")
+    @dbus.service.method("org.bluez.GattCharacteristic1", in_signature="a{sv}", out_signature="ay")
     def ReadValue(self, options):
         if alarm_active:
-            print("⛔ Alarm active → denying read")
             raise dbus.exceptions.DBusException("org.bluez.Error.NotAuthorized", "Alarm active")
         if not token_verified or options.get("device") != authorized_device_path:
-            print("⛔ Unauthorized read attempt")
             trigger_alarm()
             raise dbus.exceptions.DBusException("org.bluez.Error.NotAuthorized", "Unauthorized")
         return self.value
-
-    @dbus.service.method("org.bluez.GattCharacteristic1",
-                         in_signature="aya{sv}", out_signature="")
+    @dbus.service.method("org.bluez.GattCharacteristic1", in_signature="aya{sv}", out_signature="")
     def WriteValue(self, value, options):
         if alarm_active:
-            print("⛔ Alarm active → denying write")
             raise dbus.exceptions.DBusException("org.bluez.Error.NotAuthorized", "Alarm active")
         if not token_verified or options.get("device") != authorized_device_path:
-            print("⛔ Unauthorized write attempt")
             trigger_alarm()
             raise dbus.exceptions.DBusException("org.bluez.Error.NotAuthorized", "Unauthorized")
         self.value = value
-        print("✅ Authorized write:", list(value))
         self.PropertiesChanged("org.bluez.GattCharacteristic1", {"Value": self.value}, [])
-        
-        
-
 class ControlCharacteristic(Characteristic):
     def __init__(self, bus, index, service):
         super().__init__(bus, index, CONTROL_CHAR_UUID, ["write"], service)
-
-    @dbus.service.method("org.bluez.GattCharacteristic1",
-                         in_signature="aya{sv}", out_signature="")
+    @dbus.service.method("org.bluez.GattCharacteristic1", in_signature="aya{sv}", out_signature="")
     def WriteValue(self, value, options):
         if alarm_active:
-            print("⛔ Alarm active → denying control write")
             raise dbus.exceptions.DBusException("org.bluez.Error.NotAuthorized", "Alarm active")
-
-        device = options.get("device")
-        payload = bytes(value).decode("utf-8", errors="ignore").strip().lower()
-        print(f"📝 ControlCharacteristic write from {path_to_mac(device)}: {payload}")
-
+        device, payload = options.get("device"), bytes(value).decode("utf-8", errors="ignore").strip().lower()
         if not token_verified or device != authorized_device_path:
-            print("⛔ Unauthorized control write attempt")
             trigger_alarm()
             raise dbus.exceptions.DBusException("org.bluez.Error.NotAuthorized", "Unauthorized")
-
         if payload == "clear":
-            print("✅ Clearing alarm via control char")
             clear_alarm()
-
-# -----------------------------
-# Bluetooth Service
-# -----------------------------
 class BluetoothService(Service):
     def __init__(self, bus, index):
         super().__init__(bus, index, SERVICE_UUID, True)
         self.add_characteristic(TokenCharacteristic(bus, 0, self))
         self.add_characteristic(SecureCharacteristic(bus, 1, self))
         self.add_characteristic(ControlCharacteristic(bus, 2, self))
-
-# -----------------------------
-# Bluetooth Application
-# -----------------------------
 class BluetoothApplication:
     def __init__(self):
         global bus
-        self.bus = dbus.SystemBus()
+        self.bus, self.app = dbus.SystemBus(), Application(dbus.SystemBus())
         bus = self.bus
-        self.app = Application(self.bus)
-        
         self.adapter_path = self._find_adapter()
-        if not self.adapter_path:
-            raise RuntimeError("BLE adapter not found")
-
-        self.ad_manager = dbus.Interface(self.bus.get_object("org.bluez", self.adapter_path),
-                                         "org.bluez.LEAdvertisingManager1")
-        self.service_manager = dbus.Interface(self.bus.get_object("org.bluez", self.adapter_path),
-                                             "org.bluez.GattManager1")
-
-        # -------------------------
-        # Create advertisement objects ONCE and reuse them (Option 1)
-        # This prevents repeated dbus.service.Object registration errors.
-        # -------------------------
-        try:
-            # create and keep the advertisement objects so they are not re-added repeatedly
-            self.gatt_adv = GattAdvertisement(self.bus, 0)
-        except Exception as e:
-            # if creating fails, log but continue; creation usually registers the object path
-            print(f"⚠️ Could not create GATT advert object at init: {e}")
-            self.gatt_adv = None
-
-        try:
-            self.ibeacon_adv = IBeaconAdvertisement(self.bus, 1)
-        except Exception as e:
-            print(f"⚠️ Could not create iBeacon advert object at init: {e}")
-            self.ibeacon_adv = None
-
+        if not self.adapter_path: raise RuntimeError("BLE adapter not found")
+        self.ad_manager = dbus.Interface(bus.get_object("org.bluez", self.adapter_path), "org.bluez.LEAdvertisingManager1")
+        self.service_manager = dbus.Interface(bus.get_object("org.bluez", self.adapter_path), "org.bluez.GattManager1")
+        try: self.gatt_adv = GattAdvertisement(bus, 0)
+        except Exception as e: print(f"⚠️ Could not create GATT advert object: {e}"); self.gatt_adv = None
+        try: self.ibeacon_adv = IBeaconAdvertisement(bus, 1)
+        except Exception as e: print(f"⚠️ Could not create iBeacon advert object: {e}"); self.ibeacon_adv = None
     def _find_adapter(self):
-        om = dbus.Interface(self.bus.get_object("org.bluez", "/"),
-                            "org.freedesktop.DBus.ObjectManager")
+        om = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
         for path, props in om.GetManagedObjects().items():
-            if "org.bluez.LEAdvertisingManager1" in props:
-                return path
+            if "org.bluez.LEAdvertisingManager1" in props: return path
         return None
-
     def _register_advert(self, adv_obj):
         global current_adv
-        # --- Avoid re-registering the same advertisement object ---
-        try:
-            if current_adv and hasattr(current_adv, "get_path") and hasattr(adv_obj, "get_path"):
-                if current_adv.get_path() == adv_obj.get_path():
-                    # same advertisement already active — skip re-registration
-                    print("➡️ Advertisement already active — skipping register")
-                    return
-        except Exception:
-            # if any introspection fails, continue with default behavior
-            pass
-
-        # Unregister existing advertisement slot (keeps single-slot controller semantics)
         self._unregister_advert()
         current_adv = adv_obj
-        try:
-            self.ad_manager.RegisterAdvertisement(current_adv.get_path(), {},
-                reply_handler=lambda: print("✅ Advertisement registered"),
-                error_handler=lambda e: print(f"❌ Ad register error: {e}"))
-        except Exception as e:
-            print(f"⚠️ RegisterAdvertisement exception: {e}")
-
+        try: self.ad_manager.RegisterAdvertisement(current_adv.get_path(), {}, reply_handler=lambda: print("✅ Advertisement registered"), error_handler=lambda e: print(f"❌ Ad register error: {e}"))
+        except Exception as e: print(f"⚠️ RegisterAdvertisement exception: {e}")
     def _unregister_advert(self):
         global current_adv, adv_refresh_id
         if current_adv:
-            try:
-                self.ad_manager.UnregisterAdvertisement(current_adv.get_path())
-                print("🛑 Advertisement unregistered")
-            except Exception:
-                pass
-            # do NOT delete the advertisement object — we reuse the instance
+            try: self.ad_manager.UnregisterAdvertisement(current_adv.get_path())
+            except Exception: pass
             current_adv = None
         if adv_refresh_id:
             try: GLib.source_remove(adv_refresh_id)
             except Exception: pass
             adv_refresh_id = None
-
     def start_gatt_advert(self):
-        # Reuse the pre-created gatt_adv object instead of creating a new one each time.
-        if not self.gatt_adv:
-            # fallback: create if it wasn't created at init
-            try:
-                self.gatt_adv = GattAdvertisement(self.bus, 0)
-            except Exception as e:
-                print(f"⚠️ Failed to create GATT advert on demand: {e}")
-                return
-
+        if not self.gatt_adv: return
         print("➡️ Starting connectable GATT advertisement (normal mode)")
         self._register_advert(self.gatt_adv)
-
-        def refresh_gatt_token():
-            # Keep advertisement minimal
-            return True
-
         global adv_refresh_id
-        if adv_refresh_id:
-            try:
-                GLib.source_remove(adv_refresh_id)
-            except Exception:
-                pass
-        adv_refresh_id = GLib.timeout_add_seconds(TOKEN_WINDOW, refresh_gatt_token)
-
+        if adv_refresh_id: GLib.source_remove(adv_refresh_id)
+        adv_refresh_id = GLib.timeout_add_seconds(TOKEN_WINDOW, lambda: True)
     def start_ibeacon_advert(self):
-        # Reuse the pre-created ibeacon_adv object instead of creating a new one each time.
-        if not self.ibeacon_adv:
-            try:
-                self.ibeacon_adv = IBeaconAdvertisement(self.bus, 1)
-            except Exception as e:
-                print(f"⚠️ Failed to create iBeacon advert on demand: {e}")
-                return
-
+        if not self.ibeacon_adv: return
         print("➡️ Switching to iBeacon advertisement (alarm mode)")
         self._register_advert(self.ibeacon_adv)
-
         def refresh_ibeacon():
-            try:
-                payload = build_ibeacon_payload()
-                # Replace manufacturer data in-place by re-adding
-                current_adv.add_manufacturer_data(IBEACON_COMPANY_ID, payload)                
-                uuid = ''.join(f'{b:02X}' for b in payload[2:18])
-                major = (payload[18] << 8) | payload[19]
-                minor = (payload[20] << 8) | payload[21]
-                tx_power = payload[22] - 256 if payload[22] > 127 else payload[22]
-
-                print(f"UUID={uuid}, Major={major}, Minor={minor}, TX Power={tx_power}")
-
-            except Exception as e:
-                print(f"⚠️ Failed to refresh iBeacon payload: {e}")
+            current_adv.add_manufacturer_data(IBEACON_COMPANY_ID, build_ibeacon_payload())
             return True
-
         global adv_refresh_id
-        if adv_refresh_id:
-            try:
-                GLib.source_remove(adv_refresh_id)
-            except Exception:
-                pass
+        if adv_refresh_id: GLib.source_remove(adv_refresh_id)
         adv_refresh_id = GLib.timeout_add_seconds(TOKEN_WINDOW, refresh_ibeacon)
-
     def run(self):
-        service = BluetoothService(self.bus, 0)
-        self.app.add_service(service)
-        try:
-            two_wheeler = TwoWheelerService(self.bus, 1)
-            self.app.add_service(two_wheeler)
-        except Exception:
-            pass
-
-        self.service_manager.RegisterApplication(self.app.get_path(), {},
-            reply_handler=lambda: (print("✅ GATT app registered"), self.start_gatt_advert()),
-            error_handler=lambda e: (print(f"❌ Failed to register app: {e}"), sys.exit(1)))
-
+        self.app.add_service(BluetoothService(bus, 0))
+        try: self.app.add_service(TwoWheelerService(bus, 1))
+        except Exception: pass
+        self.service_manager.RegisterApplication(self.app.get_path(), {}, reply_handler=lambda: (print("✅ GATT app registered"), self.start_gatt_advert()), error_handler=lambda e: (print(f"❌ Failed to register app: {e}"), sys.exit(1)))
         GLib.MainLoop().run()
-
     def cleanup(self):
         self._unregister_advert()
         try: self.service_manager.UnregisterApplication(self.app.get_path())
         except Exception: pass
 
 # -----------------------------
-# Alarm
+# Alarm & Push Button Logic
 # -----------------------------
 def trigger_alarm():
     global alarm_active
     if alarm_active: return
     alarm_active = True
     print("🚨 Alarm triggered! Switching to iBeacon mode.")
-    try:
-        GPIO.output(BUZZER_PIN, GPIO.HIGH)
-        GLib.timeout_add_seconds(3, lambda *_: GPIO.output(BUZZER_PIN, GPIO.LOW) or False)
-    except Exception: pass
+    if buzzer:
+        try:
+            buzzer.on()
+            GLib.timeout_add_seconds(3, lambda *_: buzzer.off() or False)
+        except Exception as e:
+            print(f"⚠️ Could not activate buzzer: {e}")
     app.start_ibeacon_advert()
-
 def clear_alarm():
     global alarm_active
     if not alarm_active:
@@ -428,285 +269,170 @@ def clear_alarm():
     alarm_active = False
     print("✅ Alarm cleared. Back to normal mode.")
     app.start_gatt_advert()
-
-# -----------------------------
-# Connection Handling
-# -----------------------------
+def handle_button_press():
+    global ignition_status
+    if token_verified:
+        ignition_status = not ignition_status
+        print(f"🟢 PUSH BUTTON: Ignition turned {'ON' if ignition_status else 'OFF'}")
+    else:
+        print("🔵 PUSH BUTTON: Device is not connected through bluetooth.")
 def ensure_bonding(path, mac):
     try:
         dev = bus.get_object("org.bluez", path)
         props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
-        paired = bool(props.Get("org.bluez.Device1", "Paired"))
-        if not paired:
-            print(f"📌 Initiating bonding for {mac}")
+        if not bool(props.Get("org.bluez.Device1", "Paired")):
             dbus.Interface(dev, "org.bluez.Device1").Pair()
-        return props
-    except Exception as e:
-        print(f"⚠️ Bonding check failed: {e}")
-        return None
+    except Exception as e: print(f"⚠️ Bonding check failed: {e}")
 
+# -----------------------------
+# Connection Handling & Discovery
+# -----------------------------
 def handle_trusted_reconnect(mac, path, props):
     global token_verified, authorized_device_path, auto_reconnect_id, connecting_attempt
-    if mac == last_trusted_mac:
-        print(f"✅ Owner {mac} reconnected")
-        authorized_device_path = path
-        token_verified = True
-        app.start_gatt_advert()
+    if mac != last_trusted_mac: return
+    
+    print(f"✅ Owner {mac} reconnected.")
+    token_verified, authorized_device_path, connecting_attempt = True, path, False
+    app.start_gatt_advert()
+    stop_discovery()
 
-        # stop auto-reconnect attempts & discovery
-        if auto_reconnect_id:
-            GLib.source_remove(auto_reconnect_id)
-            auto_reconnect_id = None
-        # --- Stop discovery so adapter stops scanning and Connect() won't be interfered with ---
+    ## MODIFIED: Safely remove the reconnect timer.
+    if auto_reconnect_id:
         try:
-            stop_discovery()
+            GLib.source_remove(auto_reconnect_id)
         except Exception:
-            pass
-        # reset connecting guard in case it was set
-        connecting_attempt = False
-        #stop_discovery()
-
+            pass # Suppress error if ID is already invalid (due to a race condition)
+        auto_reconnect_id = None
 
 def handle_disconnect(mac, path):
     global token_verified, authorized_device_path, auto_reconnect_id
-#     print(f"🔌 Device disconnected: {mac}")
-    token_verified = False
-    authorized_device_path = None
-
-    if mac == last_trusted_mac:
-        print("ℹ️ Owner disconnected → starting auto-reconnect attempts")
-        start_discovery()
+    # Only act if the trusted device is the one that disconnected
+    if mac == last_trusted_mac and token_verified:
+        print(f"ℹ️ Owner {mac} disconnected → starting auto-reconnect attempts")
+        token_verified, authorized_device_path = False, None
+        
+        # Only start a new timer if one isn't already running
         if auto_reconnect_id is None:
+            start_discovery()
             auto_reconnect_id = GLib.timeout_add_seconds(10, attempt_autoconnect)
-    elif not alarm_active:
-        app.start_gatt_advert()
-
 
 def properties_changed_handler(interface, changed, invalidated, path=None):
     if interface != "org.bluez.Device1": return
     mac = path_to_mac(path)
-
     if "Connected" in changed:
         if changed["Connected"]:
-            print(f"🔗 Device connected: {mac}")
-            props = ensure_bonding(path, mac)
-            if mac == last_trusted_mac:
-                print("✅ Trusted device connected")
-                handle_trusted_reconnect(mac, path, props)
+            ensure_bonding(path, mac)
+            if mac == last_trusted_mac: handle_trusted_reconnect(mac, path, None)
             else:
-                print(f"⛔ Unknown device {mac} → Alarm + force disconnect")
                 trigger_alarm()
-                try:
-                    dbus.Interface(bus.get_object("org.bluez", path), "org.bluez.Device1").Disconnect()
-                except Exception as e:
-                    print(f"⚠️ Could not disconnect {mac}: {e}")
-        else:
-            handle_disconnect(mac, path)
-
+                try: dbus.Interface(bus.get_object("org.bluez", path), "org.bluez.Device1").Disconnect()
+                except Exception as e: print(f"⚠️ Could not disconnect {mac}: {e}")
+        else: handle_disconnect(mac, path)
 def interfaces_removed_handler(path, interfaces):
-    if "org.bluez.Device1" in interfaces:
-        mac = path_to_mac(path)
-        #print(f"🗑️ InterfacesRemoved: {mac}")
-        handle_disconnect(mac, path)
-        
-# 
-# def scan_trusted_devices(timeout=8):
-#     print("performing inquiry...")
-#     nearby_devices = bluetooth.discover_devices(lookup_names = True)
-#     print("found %d devices" % len(nearby_devices))
-#     for addr, name in nearby_devices:
-#         print("  %s - %s" % (addr, name))
-#     return nearby_devices
-#     
-#     
-#     """Scan for nearby classic Bluetooth devices using bluetoothctl."""
-#     # Start scan
-#     scan_proc = subprocess.Popen(
-#         ["bluetoothctl"],
-#         stdin=subprocess.PIPE,
-#         stdout=subprocess.PIPE,
-#         stderr=subprocess.STDOUT,
-#         text=True,
-#         bufsize=1
-#     )
-#     
-#     devices = {}
-#     
-#     # Turn scanning on
-#     scan_proc.stdin.write("scan on\n")
-#     scan_proc.stdin.flush()
-# 
-#     start_time = time.time()
-#     while time.time() - start_time < timeout:
-#         line = scan_proc.stdout.readline()
-#         if not line:
-#             continue
-#         m = re.search(r"Device ([0-9A-F:]{17}) (.+)", line)
-#         if m:
-#             addr, name = m.groups()
-#             devices[addr] = name
-# 
-#     # Stop scanning
-#     scan_proc.stdin.write("scan off\n")
-#     scan_proc.stdin.flush()
-#     scan_proc.terminate()
-# 
-#     return list(devices.items())
-
-# -----------------------------
-# Discovery helpers
-# -----------------------------
+    if "org.bluez.Device1" in interfaces: handle_disconnect(path_to_mac(path), path)
 def start_discovery():
     global discovery_active
-    if discovery_active:
-        return
+    if discovery_active: return
     try:
         adapter = bus.get_object("org.bluez", app.adapter_path)
         dbus.Interface(adapter, "org.bluez.Adapter1").StartDiscovery()
-        discovery_active = True
         print("🔎 Discovery started")
-    except Exception as e:
-        print(f"⚠️ Could not start discovery: {e}")
-
+        discovery_active = True
+    except Exception: pass
 def stop_discovery():
     global discovery_active
-    if not discovery_active:
-        return
+    if not discovery_active: return
     try:
         adapter = bus.get_object("org.bluez", app.adapter_path)
         dbus.Interface(adapter, "org.bluez.Adapter1").StopDiscovery()
-        discovery_active = False
         print("🛑 Discovery stopped")
-    except Exception as e:
-        print(f"⚠️ Could not stop discovery: {e}")
-# -----------------------------
-# Auto-reconnect manager
-# -----------------------------
-
+        discovery_active = False
+    except Exception: pass
 def clear_connecting_flag():
     global connecting_attempt
     connecting_attempt = False
-    return False  # remove the GLib timeout callback
-
+    return False
 def attempt_autoconnect():
-    """
-    Try to reconnect the trusted device using BlueZ discovery.
-    """
-    global last_trusted_mac, authorized_device_path
-    global last_connect_attempt, auto_reconnect_id, connecting_attempt
-
+    global last_trusted_mac, last_connect_attempt, auto_reconnect_id, connecting_attempt
+    
+    # If the timer is somehow running without a trusted device, stop.
     if not last_trusted_mac:
-        return False
+        auto_reconnect_id = None
+        return False # Stop the timer
 
-    om = dbus.Interface(bus.get_object("org.bluez", "/"),
-                        "org.freedesktop.DBus.ObjectManager")
+    # Prevent spamming connect attempts
+    if connecting_attempt or (time.time() - last_connect_attempt < CONNECT_COOLDOWN):
+        return True # Keep timer running, but do nothing this cycle
+
+    ## MODIFIED: This logic is now fixed and robust.
+    om = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
     managed = om.GetManagedObjects()
 
-    target_path = None
-    props_iface = None
+    target_path, props_iface = None, None
     for path, ifaces in managed.items():
-        if "org.bluez.Device1" in ifaces:
-            props = ifaces["org.bluez.Device1"]
-            addr = props.get("Address")
-            if addr and addr.upper() == last_trusted_mac.upper():
-                target_path = path
-                props_iface = props
-                break
+        if "org.bluez.Device1" in ifaces and ifaces["org.bluez.Device1"].get("Address", "").upper() == last_trusted_mac.upper():
+            target_path, props_iface = path, ifaces["org.bluez.Device1"]
+            break
 
     if not target_path:
-        # Not found in managed objects — keep discovery running and retry later
-        print(f"🔍 Trusted device {last_trusted_mac} not found → keep scanning")
-        start_discovery()
-        return True
+        print(f"🔍 Trusted device {last_trusted_mac} not found yet, continuing scan...")
+        return True # Keep timer running
 
-    connected = props_iface.get("Connected", False)
-    connecting = props_iface.get("Connecting", False)  # may not exist on all BlueZ versions
-    paired = props_iface.get("Paired", False)
+    if props_iface.get("Connected", False):
+        print("✅ Device found connected during scan. Stopping reconnect timer.")
+        auto_reconnect_id = None
+        return False # Stop the timer
 
-    if connected:
-        print("✅ Trusted device connected → stop auto-reconnect loop")
-        if auto_reconnect_id:
-            GLib.source_remove(auto_reconnect_id)
-            auto_reconnect_id = None
-        # ensure discovery is stopped once connected
-        try:
-            stop_discovery()
-        except Exception:
-            pass
-        # clear any connecting flag
-        connecting_attempt = False
-        return False
-
-    if connecting:
-        print("⏳ Connection already in progress (by BlueZ) → waiting...")
-        return True
-
-    if connecting_attempt:
-        # We recently attempted a connect; avoid hammering Connect()
-        print("⏳ Local connect attempt already in progress → waiting...")
-        return True
-
-    if not paired:
-        print("⚠️ Trusted device not paired → cannot auto-connect")
-        return False
-
-    now = time.time()
-    if now - last_connect_attempt < CONNECT_COOLDOWN:
-        return True
-
-    print(f"📱 Attempting Connect() to {last_trusted_mac} at {target_path}")
+    if not props_iface.get("Paired", False):
+        print(f"⚠️ Trusted device {last_trusted_mac} is no longer paired. Cannot auto-reconnect.")
+        auto_reconnect_id = None
+        return False # Stop the timer
+        
     try:
-        # set local guard to prevent overlapping Connect() calls
+        print(f"📱 Attempting to auto-reconnect to {last_trusted_mac}...")
         connecting_attempt = True
-        dev = bus.get_object("org.bluez", target_path)
-        dbus.Interface(dev, "org.bluez.Device1").Connect()
-        last_connect_attempt = now
-        # schedule clearing the local connecting flag after cooldown so we can retry if needed
+        dbus.Interface(bus.get_object("org.bluez", target_path), "org.bluez.Device1").Connect()
+        last_connect_attempt = time.time()
         GLib.timeout_add_seconds(CONNECT_COOLDOWN, clear_connecting_flag)
-    except Exception as e:
-        print(f"⚠️ Auto-connect failed: {e}")
-        # clear flag on immediate failure so next scheduled loop can try again
+    except Exception:
         connecting_attempt = False
-
-    return True
+        
+    return True # Keep timer running
 
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
-
     agent = NoInputNoOutputAgent(bus)
     mgr = dbus.Interface(bus.get_object("org.bluez", "/org/bluez"), "org.bluez.AgentManager1")
-    try: mgr.RegisterAgent("/test/agent", "NoInputNoOutput")
-    except dbus.exceptions.DBusException as e:
-        if "AlreadyExists" not in str(e): raise
-    mgr.RequestDefaultAgent("/test/agent")
-    print("🔑 Agent registered & set as default")
+    try:
+        mgr.RegisterAgent("/test/agent", "NoInputNoOutput")
+        mgr.RequestDefaultAgent("/test/agent")
+        print("🔑 Agent registered & set as default")
+    except Exception as e:
+        print(f"⚠️ Could not register agent: {e}")
 
     subprocess.run(["bluetoothctl", "discoverable", "on"], check=False)
     subprocess.run(["bluetoothctl", "pairable", "on"], check=False)
 
-    # 🔎 Signal receivers
-    bus.add_signal_receiver(
-        properties_changed_handler,
-        dbus_interface="org.freedesktop.DBus.Properties",
-        signal_name="PropertiesChanged",
-        path_keyword="path"
-    )
-    bus.add_signal_receiver(
-        interfaces_removed_handler,
-        dbus_interface="org.freedesktop.DBus.ObjectManager",
-        signal_name="InterfacesRemoved"
-    )
-    print("🔎 DBus signal receivers registered (PropertiesChanged, InterfacesRemoved)")
+    if factory:
+        try:
+            button = Button(PUSH_BUTTON_PIN, pull_up=True, bounce_time=0.3, pin_factory=factory)
+            button.when_pressed = handle_button_press
+            print(f"🔘 Push button handler registered on GPIO {PUSH_BUTTON_PIN} using pigpio factory.")
+        except Exception as e:
+            print(f"⚠️ Could not register button handler with pigpio: {e}")
+    
+    bus.add_signal_receiver(properties_changed_handler, dbus_interface="org.freedesktop.DBus.Properties", signal_name="PropertiesChanged", path_keyword="path")
+    bus.add_signal_receiver(interfaces_removed_handler, dbus_interface="org.freedesktop.DBus.ObjectManager", signal_name="InterfacesRemoved")
+    print("🔎 DBus signal receivers registered")
     
     app = BluetoothApplication()
     try:
         app.run()
     except KeyboardInterrupt:
         app.cleanup()
-        GPIO.cleanup()
+        print("\n✨ Exiting gracefully.")
         sys.exit(0)
