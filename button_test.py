@@ -5,7 +5,7 @@ import time
 
 # --- IMPORTANT ---
 # Make sure this pin number matches the GPIO pin your button is connected to.
-BUTTON_PIN = 27 
+BUTTON_PIN = 24 
 # -----------------
 
 print(f"--- Minimal Button Test on GPIO {BUTTON_PIN} ---")
