@@ -69,7 +69,7 @@ ignition_characteristic_obj = None
 # --- GPIOZERO SETUP ---
 try:
     factory = PiGPIOFactory()
-    ignition_led = DigitalOutputDevice(IGNITION_PIN, pin_factory=factory)
+    ignition_led = DigitalOutputDevice(IGNITION_PIN,active_high=True,pin_factory=factory)
     print(f"💡 Ignition LED initialized on GPIO {IGNITION_PIN} using pigpio factory.")
     
     buzzer = DigitalOutputDevice(BUZZER_PIN, pin_factory=factory)
