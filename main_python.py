@@ -272,7 +272,13 @@ class BluetoothApplication:
         if not self.ibeacon_adv: return
         print("➡️ Starting iBeacon ad (alarm mode)"); self._register_advert(self.ibeacon_adv)
         def refresh_ibeacon():
-            current_adv.add_manufacturer_data(IBEACON_COMPANY_ID, build_ibeacon_payload()); return True
+            current_adv.add_manufacturer_data(IBEACON_COMPANY_ID, build_ibeacon_payload())
+            uuid = ''.join(f'{b:02X}' for b in payload[2:18])
+            major = (payload[18] << 8) | payload[19]
+            minor = (payload[20] << 8) | payload[21]
+            print(f"🔁 iBeacon payload refreshed (minor={minor})")
+            tx_power = payload[22] - 256 if payload[22] > 127 else payload[22]
+            print(f"UUID={uuid}, Major={major}, Minor={minor}, TX Power={tx_power}"); return True
         global adv_refresh_id
         if adv_refresh_id: GLib.source_remove(adv_refresh_id)
         adv_refresh_id = GLib.timeout_add_seconds(TOKEN_WINDOW, refresh_ibeacon)
